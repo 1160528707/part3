@@ -1,23 +1,19 @@
 from __future__ import annotations
 
-"""Order-aware and conditional evidence-lattice consistency losses.
+"""Conditional evidence-lattice consistency losses for CLSL-v2.
 
-This module is a drop-in replacement for the original `lattice_consistency.py`.
-It keeps the old function name `evidence_lattice_consistency`, but replaces
-plain probability MSE with a Bernoulli KL / Jensen-Shannon style posterior loss
-and adds a reusable class for approximating the key CLSL condition
+The old prototype used same-sample MSE between coarse and fine marginal
+probabilities. This file keeps the public function name but upgrades it to
+Bernoulli KL/Jensen-Shannon divergence and adds a mini-batch approximation to
 
     p(Y | X_coarse) ~= E[p(Y | X_fine) | X_coarse].
 
-The conditional expectation is approximated within a mini-batch by kernel
-aggregation over coarse-view representations.  This is still simple enough for
-CPU experiments, but is much harder for reviewers to dismiss as vanilla
-teacher-student distillation because the fine-view target is no longer just the
-same patient's full-view prediction.
+The conditional expectation is approximated by kernel aggregation over coarse
+representations, so the target is not merely the same patient's fine-view output.
 """
 
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional
 
 import torch
 from torch import nn
@@ -49,12 +45,9 @@ def view_gap_weight(
     fine_mask: Optional[torch.Tensor],
     fallback: float = 1.0,
 ) -> torch.Tensor | float:
-    """Return an information-gap weight for a coarse<=fine view pair.
+    """Information-gap weight for a coarse <= fine pair.
 
-    If masks are [B,F], the result is [B].  The value increases when fine_view
-    contains many features unavailable to coarse_view.  This lets entropy
-    monotonicity be weak for nearly identical views and stronger for genuine
-    evidence gaps.
+    Larger when fine_view contains many features unavailable to coarse_view.
     """
     if coarse_mask is None or fine_mask is None:
         return fallback
@@ -77,21 +70,22 @@ def evidence_lattice_consistency(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Backward-compatible pairwise lattice consistency.
 
-    Original code used `F.mse_loss(coarse_probs, fine_probs.detach())`.  This
-    replacement uses a distributional divergence for Bernoulli label marginals
-    and an information-gap weighted entropy-order penalty.
+    Returns (posterior_consistency, entropy_monotonicity).
     """
     target = fine_probs.detach()
-    if divergence.lower() == "mse":
+    div = divergence.lower()
+    if div == "mse":
         consistency = F.mse_loss(coarse_probs, target)
-    elif divergence.lower() in {"skl", "sym_kl", "symmetric_kl"}:
+    elif div in {"skl", "sym_kl", "symmetric_kl"}:
         consistency = symmetric_bernoulli_kl(coarse_probs, target).mean()
+    elif div in {"kl", "forward_kl"}:
+        consistency = bernoulli_kl(target, coarse_probs).mean()
     else:
         consistency = bernoulli_js(coarse_probs, target).mean()
 
     gap = view_gap_weight(coarse_mask, fine_mask, fallback=1.0)
     if torch.is_tensor(gap):
-        gap = gap.to(coarse_entropy.device)
+        gap = gap.to(coarse_entropy.device, coarse_entropy.dtype)
     margin = float(entropy_margin) * gap
     monotonic = F.relu(fine_entropy.detach() + margin - coarse_entropy).mean()
     return consistency, monotonic
@@ -108,15 +102,13 @@ class ConditionalLatticeDiagnostics:
 class ConditionalLatticeConsistency(nn.Module):
     """Mini-batch approximation to E[p(Y|X_fine) | X_coarse].
 
-    Given coarse probabilities p_c, fine probabilities p_f, and a coarse-view
-    representation r_c, the target for sample i is
+    Given coarse probabilities p_c, fine probabilities p_f, and a coarse
+    representation r_c, target q_i is
 
-        q_i = sum_j softmax(-||r_i-r_j||^2/tau)_j p_f[j].
+        q_i = sum_j softmax(-||r_i-r_j||^2 / tau)_j p_f[j].
 
-    This changes the lattice term from same-sample distillation to conditional
-    posterior smoothing over patients with similar coarse evidence.  Set
-    `leave_one_out=True` to avoid the trivial identity target; for small batches
-    the implementation automatically falls back to including self-neighbors.
+    With leave_one_out=True, the same sample is removed when the batch size is
+    large enough, reducing collapse into trivial same-patient distillation.
     """
 
     def __init__(
@@ -144,33 +136,41 @@ class ConditionalLatticeConsistency(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if coarse_repr is None or coarse_repr.size(0) <= 1:
             target = fine_probs
-            entropy = torch.zeros((), device=fine_probs.device)
+            entropy = torch.zeros((), device=fine_probs.device, dtype=fine_probs.dtype)
             return (target.detach() if self.detach_teacher else target), entropy
 
         r = F.normalize(coarse_repr.float(), dim=-1)
         dist2 = torch.cdist(r, r, p=2.0).pow(2)
         logits = -dist2 / max(self.temperature, self.eps)
-
         b = fine_probs.size(0)
+
         if valid is not None:
-            valid = valid.bool().view(1, b)
-            logits = logits.masked_fill(~valid, -1e9)
+            valid_mask = valid.bool().view(1, b)
+            logits = logits.masked_fill(~valid_mask, -1e9)
 
         if self.leave_one_out and b > 2:
             eye = torch.eye(b, device=fine_probs.device, dtype=torch.bool)
             logits = logits.masked_fill(eye, -1e9)
+            bad = torch.isneginf(logits).all(dim=1)
+            if bad.any():
+                logits[bad] = -dist2[bad] / max(self.temperature, self.eps)
 
-        # If a row became invalid, re-enable self-neighbor for numerical safety.
-        bad = torch.isneginf(logits).all(dim=1)
-        if bad.any():
-            logits[bad] = -dist2[bad] / max(self.temperature, self.eps)
-
-        weights = torch.softmax(logits, dim=-1)
+        weights = torch.softmax(logits, dim=-1).to(fine_probs.dtype)
         target = weights @ fine_probs
         neighbor_entropy = -(weights.clamp_min(self.eps).log() * weights).sum(dim=-1).mean()
         if self.detach_teacher:
             target = target.detach()
         return target, neighbor_entropy
+
+    def _divergence(self, coarse_probs: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        div = self.divergence.lower()
+        if div == "mse":
+            return F.mse_loss(coarse_probs, target)
+        if div in {"skl", "sym_kl", "symmetric_kl"}:
+            return symmetric_bernoulli_kl(coarse_probs, target, self.eps).mean()
+        if div in {"kl", "forward_kl"}:
+            return bernoulli_kl(target, coarse_probs, self.eps).mean()
+        return bernoulli_js(coarse_probs, target, self.eps).mean()
 
     def forward(
         self,
@@ -185,22 +185,18 @@ class ConditionalLatticeConsistency(nn.Module):
         return_diagnostics: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, ConditionalLatticeDiagnostics]:
         target, nbr_entropy = self.conditional_teacher(fine_probs, coarse_repr, valid=valid)
-
-        if self.divergence.lower() == "mse":
-            consistency = F.mse_loss(coarse_probs, target)
-        elif self.divergence.lower() in {"skl", "sym_kl", "symmetric_kl"}:
-            consistency = symmetric_bernoulli_kl(coarse_probs, target, self.eps).mean()
-        else:
-            consistency = bernoulli_js(coarse_probs, target, self.eps).mean()
+        consistency = self._divergence(coarse_probs, target)
 
         gap = view_gap_weight(coarse_mask, fine_mask, fallback=1.0)
         if torch.is_tensor(gap):
-            gap = gap.to(coarse_entropy.device)
+            gap = gap.to(coarse_entropy.device, coarse_entropy.dtype)
             mean_gap = gap.mean()
         else:
-            mean_gap = torch.tensor(float(gap), device=coarse_entropy.device)
+            mean_gap = torch.tensor(float(gap), device=coarse_entropy.device, dtype=coarse_entropy.dtype)
+
         monotonicity = F.relu(fine_entropy.detach() + self.entropy_margin * gap - coarse_entropy).mean()
         loss = consistency + monotonicity
+
         if not return_diagnostics:
             return loss
         return loss, ConditionalLatticeDiagnostics(
