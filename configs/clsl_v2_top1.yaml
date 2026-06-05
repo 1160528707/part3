@@ -1,0 +1,26 @@
+# Add these keys to your existing configs/clsl_v2.yaml.
+# Keep your data/model columns unchanged; these are method-level upgrades.
+loss:
+  future_nll: 1.0
+  current_nll: 0.35
+  conditional_lattice_consistency: 0.35
+  conditional_lattice_temperature: 0.15
+  conditional_lattice_divergence: "js"
+  conditional_lattice_leave_one_out: true
+  entropy_monotonic: 0.10
+  entropy_margin: 0.02
+  kl: 0.001
+  observation_mask: 0.08
+  observation_view: 0.05
+  adversarial_view: 0.03
+  brier_calibration: 0.02
+  transition_semigroup: 0.03
+  graph_sparse: 0.002
+  graph_prior_alignment: 0.01
+  graph_diag: 0.001
+
+model:
+  # Existing keys stay valid. Optional new defaults in patched modules:
+  adaptive_graph_rank: 8
+  ode_steps: 4
+  transition_time_scale: 180.0

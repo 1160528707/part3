@@ -11,6 +11,11 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
+
+from clsl_v2.train_top1_patch import compute_batch_loss_top1
+from clsl_v2.losses.lattice_consistency import ConditionalLatticeConsistency
+
+
 from clsl_v2.data.preprocess import load_table, TablePreprocessor, group_train_val_test_split
 from clsl_v2.data.dataset import EHRDataset
 from clsl_v2.data.schema import Schema
@@ -199,6 +204,12 @@ def main():
     device = torch.device("cuda" if args.device == "auto" and torch.cuda.is_available() else ("cpu" if args.device == "auto" else args.device))
     model = CLSLv2(prep.schema, cfg).to(device)
     energy_loss = LabelMarginalizationLoss(prep.schema.num_diseases).to(device)
+    lattice_loss_fn = ConditionalLatticeConsistency(
+        temperature=float(cfg["loss"].get("conditional_lattice_temperature", 0.15)),
+        divergence=str(cfg["loss"].get("conditional_lattice_divergence", "js")),
+        entropy_margin=float(cfg["loss"].get("entropy_margin", 0.02)),
+        leave_one_out=bool(cfg["loss"].get("conditional_lattice_leave_one_out", True)),
+    ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(cfg["train"].get("learning_rate", 8e-4)), weight_decay=float(cfg["train"].get("weight_decay", 1e-5)))
     stopper = EarlyStopping(patience=int(cfg["train"].get("patience", 8)), mode="min")
     primary_view = cfg["train"].get("primary_view", "hospital_view")
@@ -213,7 +224,14 @@ def main():
         for batch in pbar:
             batch = move_batch_to_device(batch, device)
             optimizer.zero_grad(set_to_none=True)
-            loss, stats, _ = compute_batch_loss(model, batch, cfg, energy_loss, device)
+            loss, stats, _ = compute_batch_loss_top1(
+                model=model,
+                batch=batch,
+                cfg=cfg,
+                energy_loss=energy_loss,
+                device=device,
+                lattice_loss_fn=lattice_loss_fn,
+            )
             loss.backward()
             if float(cfg["train"].get("grad_clip", 0)) > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), float(cfg["train"].get("grad_clip", 5.0)))
