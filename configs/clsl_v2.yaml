@@ -1,0 +1,164 @@
+# CLSL-v2 default configuration
+# Edit feature column names to match your MIMIC-IV / hospital model_ready.csv.
+
+project:
+  name: "模型名v2"
+  english_name: "CLSL-v2"
+  seed: 42
+  num_threads: 1
+
+data:
+  id_column: "subject_id"
+  time_delta_column: "delta_t_days"   # optional; if absent, default_delta_days is used
+  default_delta_days: 90.0
+  label_mask_suffix: "_mask"          # optional explicit mask column; NaN label also means unobserved
+  current_label_suffix: "_current"
+  future_label_suffix: "_future"
+  diseases:
+    - af
+    - renal
+    - copd
+    - diabetes
+    - cad
+    - anemia
+
+  # These columns are examples. Missing columns are skipped automatically.
+  modalities:
+    demographic:
+      - age
+      - gender
+      - sex
+    current_state:
+      - af_current
+      - renal_current
+      - copd_current
+      - diabetes_current
+      - cad_current
+      - anemia_current
+    diagnosis:
+      - heart_failure
+      - hf_diag
+      - prior_mi
+      - hypertension
+      - stroke_history
+    lab:
+      - creatinine
+      - egfr
+      - bun
+      - hemoglobin
+      - hematocrit
+      - glucose
+      - hba1c
+      - sodium
+      - potassium
+      - chloride
+      - bicarbonate
+      - wbc
+      - platelet
+      - troponin
+      - bnp
+      - ntprobnp
+    medication:
+      - diuretic
+      - acei_arb_arni
+      - beta_blocker
+      - anticoagulant
+      - antiplatelet
+      - insulin
+      - oral_hypoglycemic
+      - bronchodilator
+      - steroid
+      - iron_or_epo
+    procedure:
+      - dialysis
+      - crrt
+      - pci
+      - cabg
+      - mechanical_ventilation
+      - transfusion
+    trajectory:
+      - num_prior_admissions
+      - days_since_last_admission
+      - los_days
+      - icu_stay
+    hospital_specific:
+      - nyha
+      - lvef
+
+  # Evidence lattice views. Each view is defined by modalities, not individual columns.
+  views:
+    demo:
+      stage_index: 0
+      modalities: [demographic]
+    diagnosis:
+      stage_index: 1
+      modalities: [demographic, current_state, diagnosis]
+    initial_lab:
+      stage_index: 2
+      modalities: [demographic, current_state, diagnosis, lab, hospital_specific]
+    early_stay:
+      stage_index: 3
+      modalities: [demographic, current_state, diagnosis, lab, trajectory, hospital_specific]
+    hospital_view:
+      stage_index: 2
+      modalities: [demographic, current_state, diagnosis, lab, hospital_specific]
+    full:
+      stage_index: 4
+      modalities: [demographic, current_state, diagnosis, lab, medication, procedure, trajectory, hospital_specific]
+
+model:
+  hidden_dim: 64
+  latent_dim: 32
+  transformer_layers: 2
+  transformer_heads: 4
+  dropout: 0.15
+  gnn_layers: 2
+  use_latent_sampling: true
+  clinical_prior_edges:
+    # Edge weights are weak priors for six diseases in this order:
+    # af, renal, copd, diabetes, cad, anemia
+    af:
+      cad: 0.35
+      renal: 0.15
+      copd: 0.10
+    renal:
+      diabetes: 0.45
+      anemia: 0.40
+      cad: 0.25
+    copd:
+      anemia: 0.15
+    diabetes:
+      cad: 0.40
+      renal: 0.45
+    cad:
+      af: 0.35
+      diabetes: 0.40
+      renal: 0.25
+    anemia:
+      renal: 0.40
+      copd: 0.15
+
+train:
+  primary_view: "hospital_view"
+  lattice_views: [demo, diagnosis, initial_lab, hospital_view, full]
+  fine_view: "full"
+  test_size: 0.15
+  val_size: 0.15
+  learning_rate: 0.0008
+  weight_decay: 0.00001
+  num_workers: 0
+  grad_clip: 5.0
+  patience: 8
+  threshold: 0.5
+
+loss:
+  future_nll: 1.0
+  current_nll: 0.35
+  lattice_consistency: 0.25
+  entropy_monotonic: 0.10
+  kl: 0.001
+  observation_mask: 0.08
+  observation_view: 0.05
+  adversarial_view: 0.03
+  brier_calibration: 0.02
+  entropy_margin: 0.02
