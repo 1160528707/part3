@@ -1,0 +1,32 @@
+model:
+  hidden_dim: 128
+  latent_dim: 64
+  dropout: 0.10
+  use_latent_sampling: true
+  transformer_layers: 2
+  transformer_heads: 4
+
+  # Matryoshka/nested evidence latent dimensions.
+  latent_splits: [16, 32, 48, 64]
+
+  # Latent disease graph transformer.
+  gnn_layers: 2
+  graph_transformer_heads: 4
+  adaptive_graph_rank: 8
+  edge_temperature: 0.5
+  hard_edges: false
+
+  # Flow-matched disease-state transition.
+  ode_steps: 4
+  transition_time_scale: 180.0
+  transition_time_frequencies: 8
+
+loss:
+  max_exact_labels: 20
+  label_num_samples: 32
+  label_tb_weight: 0.10
+  edge_kl_weight: 0.01
+  edge_entropy_weight: -0.001
+  observation_propensity_weight: 0.05
+  transition_flow_weight: 0.10
+  posterior_refinement_flow_weight: 0.10
