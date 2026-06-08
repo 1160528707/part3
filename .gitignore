@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+*.pyo
+*.zip
+.clsl_top1_patch_backup/
+clsl_top1_patch_v3.sha256
